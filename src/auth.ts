@@ -8,8 +8,10 @@ import {
   sessions,
   verificationTokens,
 } from "../drizzle/schema";
+import { authConfig } from "./auth.config";
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
+  ...authConfig,
   adapter: DrizzleAdapter(db, {
     usersTable: users,
     accountsTable: accounts,
@@ -29,18 +31,4 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       from: process.env.EMAIL_FROM ?? process.env.GMAIL_USER,
     }),
   ],
-  pages: {
-    signIn: "/auth/signin",
-    verifyRequest: "/auth/verify",
-    error: "/auth/error",
-  },
-  session: {
-    strategy: "database",
-  },
-  callbacks: {
-    session({ session, user }) {
-      session.user.id = user.id;
-      return session;
-    },
-  },
 });

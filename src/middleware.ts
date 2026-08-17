@@ -1,14 +1,18 @@
-import { auth } from "@/auth";
+import NextAuth from "next-auth";
+import { authConfig } from "@/auth.config";
 import { NextResponse } from "next/server";
 import type { NextAuthRequest } from "next-auth";
 
-// Routes that don't require authentication
+// Middleware uses only the edge-safe config — no Nodemailer, no Node.js streams.
+const { auth } = NextAuth(authConfig);
+
 const PUBLIC_PATHS = [
   "/auth/signin",
   "/auth/verify",
   "/auth/error",
   "/api/auth",
   "/api/cron",
+  "/api/admin/import", // called from GitHub Actions with IMPORT_SECRET, not Auth.js
   "/_next",
   "/favicon.ico",
 ];

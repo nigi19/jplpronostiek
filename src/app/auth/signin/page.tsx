@@ -32,7 +32,7 @@ export default async function SignInPage({ searchParams }: Props) {
           <form
             action={async (formData: FormData) => {
               "use server";
-              await signIn("resend", {
+              await signIn("nodemailer", {
                 email: formData.get("email") as string,
                 redirectTo: callbackUrl ?? "/",
               });

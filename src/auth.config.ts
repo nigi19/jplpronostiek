@@ -5,6 +5,7 @@ import type { NextAuthConfig } from "next-auth";
  * Used by middleware (Edge runtime). auth.ts extends this with Nodemailer + Drizzle.
  */
 export const authConfig = {
+  trustHost: true,
   pages: {
     signIn: "/auth/signin",
     verifyRequest: "/auth/verify",

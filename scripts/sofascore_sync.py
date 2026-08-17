@@ -37,7 +37,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("sofascore_sync")
 
 BASE_URL = "https://www.sofascore.com/api/v1"
-TOURNAMENT_ID = int(os.environ.get("SOFASCORE_TOURNAMENT_ID", "38"))
+TOURNAMENT_ID = int(os.environ.get("SOFASCORE_TOURNAMENT_ID") or "38")
 APP_URL = os.environ.get("APP_URL", "http://localhost:3000").rstrip("/")
 IMPORT_SECRET = os.environ.get("IMPORT_SECRET", "")
 

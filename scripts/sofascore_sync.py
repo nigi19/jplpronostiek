@@ -23,7 +23,17 @@ import sys
 import json
 import datetime
 import logging
+from pathlib import Path
 from typing import Any, Optional
+
+# Load scripts/sofascore_sync.env when running locally (gitignored)
+_env_file = Path(__file__).parent / "sofascore_sync.env"
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 try:
     from curl_cffi import requests as curl_requests

@@ -162,7 +162,7 @@ def post_to_app(payload: dict) -> None:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=90) as resp:
             result = json.loads(resp.read().decode())
             log.info("Import response: %s", result)
     except urllib.error.HTTPError as e:

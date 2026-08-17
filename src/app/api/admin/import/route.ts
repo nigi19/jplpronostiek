@@ -1,19 +1,11 @@
-/**
- * POST /api/admin/import
- *
- * Accepts normalized fixture data from the sofascore_sync.py GitHub Actions job
- * and upserts teams, rounds, matches, then scores finished predictions.
- *
- * Authorization: Bearer <IMPORT_SECRET>
- */
-
 import { NextRequest, NextResponse } from "next/server";
-import { eq, and, isNull, inArray } from "drizzle-orm";
+import { eq, and, isNull, inArray, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { seasons, teams, rounds, matches, predictions } from "../../../../../drizzle/schema";
 import { scorePrediction } from "@/lib/scoring";
 
-// ─── Payload schema ───────────────────────────────────────────────────────────
+// Give the function the full 60 s on Vercel Hobby
+export const maxDuration = 60;
 
 interface ImportFixture {
   fixtureId: number;
@@ -24,7 +16,7 @@ interface ImportFixture {
   awayTeamId: number;
   awayTeamName: string;
   awayTeamLogo?: string | null;
-  kickoff: string; // ISO 8601
+  kickoff: string;
   status: "finished" | "in_progress" | "scheduled";
   homeGoals: number | null;
   awayGoals: number | null;
@@ -33,14 +25,11 @@ interface ImportFixture {
 interface ImportPayload {
   tournamentId: number;
   seasonId: number;
-  seasonYear: string; // e.g. "26/27"
+  seasonYear: string;
   fixtures: ImportFixture[];
 }
 
-const FINAL_STATUSES = new Set(["finished"]);
-
 export async function POST(req: NextRequest) {
-  // ── 1. Authenticate ────────────────────────────────────────────────────────
   const expectedToken = process.env.IMPORT_SECRET;
   if (!expectedToken || req.headers.get("authorization") !== `Bearer ${expectedToken}`) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -60,7 +49,7 @@ export async function POST(req: NextRequest) {
   const startedAt = new Date();
 
   try {
-    // ── 2. Find (or create) the active season ──────────────────────────────
+    // ── 1. Find or auto-create the active season ───────────────────────────
     let [season] = await db
       .select()
       .from(seasons)
@@ -68,11 +57,13 @@ export async function POST(req: NextRequest) {
       .limit(1);
 
     if (!season) {
-      // Auto-create season on first import if none exists
       const seasonName = String(payload.seasonYear);
       const yearMatch = seasonName.match(/(\d{2,4})/);
-      const year = yearMatch ? (yearMatch[1].length === 2 ? 2000 + parseInt(yearMatch[1]) : parseInt(yearMatch[1])) : new Date().getFullYear();
-
+      const year = yearMatch
+        ? yearMatch[1].length === 2
+          ? 2000 + parseInt(yearMatch[1])
+          : parseInt(yearMatch[1])
+        : new Date().getFullYear();
       const [newSeason] = await db
         .insert(seasons)
         .values({ apiLeagueId: payload.tournamentId, year, name: seasonName, isActive: true })
@@ -80,93 +71,103 @@ export async function POST(req: NextRequest) {
       season = newSeason;
     }
 
-    // ── 3. Upsert teams ────────────────────────────────────────────────────
-    const allTeamIds = [
-      ...new Set(payload.fixtures.flatMap((f) => [f.homeTeamId, f.awayTeamId])),
-    ];
-
+    // ── 2. Batch-upsert teams (1 query) ────────────────────────────────────
     const teamDataMap = new Map<number, { name: string; logoUrl: string | null }>();
     for (const f of payload.fixtures) {
       teamDataMap.set(f.homeTeamId, { name: f.homeTeamName, logoUrl: f.homeTeamLogo ?? null });
       teamDataMap.set(f.awayTeamId, { name: f.awayTeamName, logoUrl: f.awayTeamLogo ?? null });
     }
 
-    for (const [apiTeamId, data] of teamDataMap) {
-      await db
-        .insert(teams)
-        .values({ apiTeamId, name: data.name, logoUrl: data.logoUrl })
-        .onConflictDoUpdate({
-          target: teams.apiTeamId,
-          set: { name: data.name, logoUrl: data.logoUrl },
-        });
-    }
+    const teamValues = [...teamDataMap.entries()].map(([apiTeamId, d]) => ({
+      apiTeamId,
+      name: d.name,
+      logoUrl: d.logoUrl,
+    }));
 
-    // ── 4. Upsert rounds ───────────────────────────────────────────────────
+    await db
+      .insert(teams)
+      .values(teamValues)
+      .onConflictDoUpdate({
+        target: teams.apiTeamId,
+        set: {
+          name: sql`excluded.name`,
+          logoUrl: sql`excluded."logoUrl"`,
+        },
+      });
+
+    // ── 3. Batch-upsert rounds (1 query) ───────────────────────────────────
     const roundNumbers = [...new Set(payload.fixtures.map((f) => f.round))].sort((a, b) => a - b);
-    const roundDbMap = new Map<number, number>(); // roundNumber → db id
+    const roundValues = roundNumbers.map((n) => ({
+      seasonId: season.id,
+      name: `Regular Season - ${n}`,
+      number: n,
+    }));
 
-    for (const number of roundNumbers) {
-      const name = `Regular Season - ${number}`;
-      const [row] = await db
-        .insert(rounds)
-        .values({ seasonId: season.id, name, number })
-        .onConflictDoUpdate({
-          target: [rounds.seasonId, rounds.number],
-          set: { name },
-        })
-        .returning({ id: rounds.id });
-      roundDbMap.set(number, row.id);
-    }
+    await db
+      .insert(rounds)
+      .values(roundValues)
+      .onConflictDoUpdate({
+        target: [rounds.seasonId, rounds.number],
+        set: { name: sql`excluded.name` },
+      });
 
-    // ── 5. Build team apiTeamId → db id map ───────────────────────────────
-    const teamRows = await db.select().from(teams);
-    const teamDbMap = new Map<number, number>();
-    for (const t of teamRows) teamDbMap.set(t.apiTeamId, t.id);
+    // ── 4. Fetch back IDs we need for the matches FK ───────────────────────
+    const [teamRows, roundRows] = await Promise.all([
+      db.select({ id: teams.id, apiTeamId: teams.apiTeamId }).from(teams),
+      db
+        .select({ id: rounds.id, number: rounds.number })
+        .from(rounds)
+        .where(eq(rounds.seasonId, season.id)),
+    ]);
 
-    // ── 6. Upsert matches ──────────────────────────────────────────────────
+    const teamDbMap = new Map(teamRows.map((t) => [t.apiTeamId, t.id]));
+    const roundDbMap = new Map(roundRows.map((r) => [r.number, r.id]));
+
+    // ── 5. Batch-upsert matches (1 query) ──────────────────────────────────
     const now = new Date();
-    let upsertedCount = 0;
 
-    for (const f of payload.fixtures) {
+    const matchValues = payload.fixtures.flatMap((f) => {
       const roundId = roundDbMap.get(f.round);
       const homeTeamId = teamDbMap.get(f.homeTeamId);
       const awayTeamId = teamDbMap.get(f.awayTeamId);
-
-      if (!roundId || !homeTeamId || !awayTeamId) continue;
+      if (!roundId || !homeTeamId || !awayTeamId) return [];
 
       const isFinished = f.status === "finished";
-      const homeGoals = isFinished ? f.homeGoals : null;
-      const awayGoals = isFinished ? f.awayGoals : null;
-
-      // Map SofaScore status to our status field
       const status = isFinished ? "FT" : f.status === "in_progress" ? "LIVE" : "NS";
 
+      return [{
+        apiFixtureId: f.fixtureId,
+        seasonId: season.id,
+        roundId,
+        homeTeamId,
+        awayTeamId,
+        kickoff: new Date(f.kickoff),
+        status,
+        homeGoals: isFinished ? f.homeGoals : null,
+        awayGoals: isFinished ? f.awayGoals : null,
+        lastSyncedAt: now,
+      }];
+    });
+
+    if (matchValues.length > 0) {
       await db
         .insert(matches)
-        .values({
-          apiFixtureId: f.fixtureId,
-          seasonId: season.id,
-          roundId,
-          homeTeamId,
-          awayTeamId,
-          kickoff: new Date(f.kickoff),
-          status,
-          homeGoals,
-          awayGoals,
-          lastSyncedAt: now,
-        })
+        .values(matchValues)
         .onConflictDoUpdate({
           target: matches.apiFixtureId,
-          set: { status, homeGoals, awayGoals, kickoff: new Date(f.kickoff), lastSyncedAt: now },
+          set: {
+            status: sql`excluded.status`,
+            homeGoals: sql`excluded."homeGoals"`,
+            awayGoals: sql`excluded."awayGoals"`,
+            kickoff: sql`excluded.kickoff`,
+            lastSyncedAt: sql`excluded."lastSyncedAt"`,
+          },
         });
-
-      upsertedCount++;
     }
 
-    // ── 7. Score finished predictions ──────────────────────────────────────
+    // ── 6. Score finished predictions ──────────────────────────────────────
     const scoredPredictions = await scoreFinishedMatches(season.id);
 
-    // ── 8. Update season sync timestamp ───────────────────────────────────
     await db
       .update(seasons)
       .set({ lastSyncedAt: now, syncError: null })
@@ -174,28 +175,22 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       ok: true,
-      fixturesProcessed: upsertedCount,
+      fixturesProcessed: matchValues.length,
       predictionsScored: scoredPredictions,
       syncedAt: now,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[api/admin/import] Error:", message);
-
     try {
       await db
         .update(seasons)
         .set({ syncError: message, lastSyncedAt: startedAt })
         .where(eq(seasons.isActive, true));
-    } catch {
-      // best effort
-    }
-
+    } catch { /* best effort */ }
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
-
-// ─── Helper ───────────────────────────────────────────────────────────────────
 
 async function scoreFinishedMatches(seasonId: number): Promise<number> {
   const finishedMatches = await db
@@ -206,7 +201,6 @@ async function scoreFinishedMatches(seasonId: number): Promise<number> {
   if (!finishedMatches.length) return 0;
 
   const matchIds = finishedMatches.map((m) => m.id);
-
   const unscoredPreds = await db
     .select()
     .from(predictions)
@@ -224,19 +218,9 @@ async function scoreFinishedMatches(seasonId: number): Promise<number> {
   for (const pred of unscoredPreds) {
     const actual = resultMap.get(pred.matchId);
     if (!actual) continue;
-
-    const points = scorePrediction(
-      { home: pred.homeGoals, away: pred.awayGoals },
-      actual
-    );
-
-    await db
-      .update(predictions)
-      .set({ points, updatedAt: new Date() })
-      .where(eq(predictions.id, pred.id));
-
+    const points = scorePrediction({ home: pred.homeGoals, away: pred.awayGoals }, actual);
+    await db.update(predictions).set({ points, updatedAt: new Date() }).where(eq(predictions.id, pred.id));
     count++;
   }
-
   return count;
 }
